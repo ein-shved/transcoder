@@ -1,6 +1,14 @@
 use async_inotify::{WatchMask, Watcher as IWatcher};
-use inotify::WatchDescriptor;
-use std::{collections::HashMap, path::PathBuf, str::FromStr};
+use inotify::{EventMask, WatchDescriptor};
+use std::{
+    collections::HashMap,
+    fs::{metadata, remove_dir_all, remove_file, symlink_metadata},
+    io,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
+
+use crate::transcoder::Transcoder;
 
 pub struct Watcher {
     watcher: IWatcher,
@@ -32,8 +40,7 @@ impl Watcher {
         }
     }
 
-    pub fn add(&mut self, wp: WatchPair) -> async_inotify::Result<()>
-    {
+    pub fn add(&mut self, wp: WatchPair) -> async_inotify::Result<()> {
         let wd = self
             .watcher
             .add(&wp.src, &WatchMask::CREATE.union(WatchMask::DELETE))?;
@@ -45,17 +52,48 @@ impl Watcher {
         loop {
             if let Some(event) = self.watcher.next().await {
                 let wp = &self.descriptors[event.wd()];
-                if let Ok(suffix) = event.path().strip_prefix(&wp.src)
-                {
-                    println!("{:?}: {:?} -> {:?}", event.mask(), event.path(), wp.dst.join(suffix));
-                }
-                else
-                {
-                    println!("{:?}: {:?} -> unexpected watching path", event.mask(), event.path());
+                let src = event.path();
+                if let Ok(suffix) = src.strip_prefix(&wp.src) {
+                    let dst = wp.dst.join(suffix);
+                    if dst == src {
+                        continue;
+                    }
+                    if event.mask().intersects(EventMask::DELETE) {
+                        if let Err(err) = Self::delete(&dst){
+                            println!("Failed to delete {dst:?}: {err:?}");
+                        }
+                    } else if event.mask().intersects(EventMask::CREATE) {
+                        if !Self::is_dir(src) {
+                            _ = Transcoder::get().transcode(src, &dst);
+                        }
+                    } else {
+                        println!("{:?}: {:?} -> unexpected event", event.mask(), src);
+                    }
+                } else {
+                    println!("{:?}: {:?} -> unexpected watching path", event.mask(), src);
                 }
             } else {
                 break;
             }
+        }
+    }
+
+    fn delete(p: &Path) -> io::Result<()> {
+        let stat = symlink_metadata(p)?;
+        if stat.file_type().is_dir() {
+            remove_dir_all(p)?;
+        } else {
+            remove_file(p)?;
+        };
+        Ok(())
+    }
+
+    fn is_dir(p: &Path) -> bool {
+        if let Ok(stat) = metadata(p)
+        {
+            stat.is_dir()
+        } else {
+            true // Assume is_dir in case of error to make process ignores path.
         }
     }
 }
