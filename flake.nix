@@ -3,7 +3,7 @@
     A simple transcoding utility
   '';
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
   outputs =
     { nixpkgs, flake-utils, ... }:

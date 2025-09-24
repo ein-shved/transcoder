@@ -1,7 +1,9 @@
 {
   rustPlatform,
+  pkg-config,
+  ffmpeg_8,
 }:
-rustPlatform.buildRustPackage {
+rustPlatform.buildRustPackage (finalAttrs: {
   pname = "transcoder";
   version = "0.1.0";
   src = builtins.path {
@@ -17,5 +19,15 @@ rustPlatform.buildRustPackage {
   cargoLock = {
     lockFile = ./Cargo.lock;
   };
+
+  nativeBuildInputs = [
+    pkg-config
+    rustPlatform.bindgenHook
+  ];
+
+  buildInputs = [
+    ffmpeg_8
+  ];
+
   meta.mainProgram = "transcoder";
-}
+})
