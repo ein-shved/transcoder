@@ -2,11 +2,11 @@ use async_inotify::{WatchMask, Watcher as IWatcher};
 use inotify::{EventMask, WatchDescriptor};
 use std::{
     collections::HashMap,
-    fs::{metadata, remove_dir_all, remove_file, symlink_metadata},
     io,
     path::{Path, PathBuf},
     str::FromStr,
 };
+use tokio::fs::{metadata, read_dir, remove_dir_all, remove_file, symlink_metadata};
 
 use crate::transcoder::Transcoder;
 
@@ -44,6 +44,7 @@ impl Watcher {
         let wd = self
             .watcher
             .add(&wp.src, &WatchMask::CREATE.union(WatchMask::DELETE))?;
+        Self::recheck(&wp.src, &wp.dst);
         self.descriptors.insert(wd, wp);
         Ok(())
     }
@@ -52,45 +53,77 @@ impl Watcher {
         loop {
             if let Some(event) = self.watcher.next().await {
                 let wp = &self.descriptors[event.wd()];
-                let src = event.path();
-                if let Ok(suffix) = src.strip_prefix(&wp.src) {
-                    let dst = wp.dst.join(suffix);
-                    if dst == src {
-                        continue;
-                    }
-                    if event.mask().intersects(EventMask::DELETE) {
-                        if let Err(err) = Self::delete(&dst){
-                            println!("Failed to delete {dst:?}: {err:?}");
-                        }
-                    } else if event.mask().intersects(EventMask::CREATE) {
-                        if !Self::is_dir(src) {
-                            _ = Transcoder::get().transcode(src, &dst);
-                        }
-                    } else {
-                        println!("{:?}: {:?} -> unexpected event", event.mask(), src);
-                    }
-                } else {
-                    println!("{:?}: {:?} -> unexpected watching path", event.mask(), src);
-                }
+                let src = event.path().to_owned();
+                let mask = event.mask().clone();
+                let wp_src = wp.src.clone();
+                let wp_dst = wp.dst.clone();
+                tokio::spawn(async move {
+                    Self::do_action(&mask, &src, &wp_src, &wp_dst, false).await;
+                });
             } else {
                 break;
             }
         }
     }
 
-    fn delete(p: &Path) -> io::Result<()> {
-        let stat = symlink_metadata(p)?;
-        if stat.file_type().is_dir() {
-            remove_dir_all(p)?;
+    async fn do_action(event: &EventMask, f: &Path, src: &Path, dst: &Path, check_exists: bool) {
+        if let Ok(suffix) = f.strip_prefix(src) {
+            let dst = dst.join(suffix);
+            if dst == f {
+                return;
+            }
+            if event.intersects(EventMask::DELETE) {
+                if let Err(err) = Self::delete(&dst).await {
+                    println!("Failed to delete {dst:?}: {err:?}");
+                }
+            } else if event.intersects(EventMask::CREATE) {
+                if !Self::is_dir(f).await && (!f.exists() || !check_exists) {
+                    if let Err(err) = Transcoder::get().transcode(f, &dst) {
+                        println!("Failed to transcode {src:?} into {dst:?}: {err}");
+                    }
+                }
+            } else {
+                println!("{:?}: {:?} -> unexpected event", event, f);
+            }
         } else {
-            remove_file(p)?;
+            println!("{:?}: {:?} -> unexpected watching path", event, f);
+        }
+    }
+
+    fn recheck(src: &Path, dst: &Path) {
+        let src = src.to_owned();
+        let dst = dst.to_owned();
+        tokio::spawn(async move { Self::check_f(&src, &src, &dst).await });
+    }
+
+    async fn check_f(f: &Path, src: &Path, dst: &Path) {
+        if Self::is_dir(f).await {
+            if let Ok(mut dir) = read_dir(f).await {
+                while let Ok(f) = dir.next_entry().await {
+                    if let Some(f) = f {
+                        Box::pin(Self::check_f(&f.path(), src, dst)).await
+                    } else {
+                        break;
+                    }
+                }
+            }
+        } else {
+            Self::do_action(&EventMask::CREATE, f, src, dst, true).await;
+        }
+    }
+
+    async fn delete(p: &Path) -> io::Result<()> {
+        let stat = symlink_metadata(p).await?;
+        if stat.file_type().is_dir() {
+            remove_dir_all(p).await?;
+        } else {
+            remove_file(p).await?;
         };
         Ok(())
     }
 
-    fn is_dir(p: &Path) -> bool {
-        if let Ok(stat) = metadata(p)
-        {
+    async fn is_dir(p: &Path) -> bool {
+        if let Ok(stat) = metadata(p).await {
             stat.is_dir()
         } else {
             true // Assume is_dir in case of error to make process ignores path.
