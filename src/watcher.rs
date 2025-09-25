@@ -41,9 +41,13 @@ impl Watcher {
     }
 
     pub fn add(&mut self, wp: WatchPair) -> async_inotify::Result<()> {
-        let wd = self
-            .watcher
-            .add(&wp.src, &WatchMask::CREATE.union(WatchMask::DELETE))?;
+        let wd = self.watcher.add(
+            &wp.src,
+            &WatchMask::CREATE
+                .union(WatchMask::DELETE)
+                .union(WatchMask::MOVED_TO)
+                .union(WatchMask::MOVED_FROM),
+        )?;
         Self::recheck(&wp.src, &wp.dst);
         self.descriptors.insert(wd, wp);
         Ok(())
@@ -72,11 +76,11 @@ impl Watcher {
             if dst == f {
                 return;
             }
-            if event.intersects(EventMask::DELETE) {
+            if event.intersects(EventMask::DELETE.union(EventMask::MOVED_FROM)) {
                 if let Err(err) = Self::delete(&dst).await {
                     println!("Failed to delete {dst:?}: {err:?}");
                 }
-            } else if event.intersects(EventMask::CREATE) {
+            } else if event.intersects(EventMask::CREATE.union(EventMask::MOVED_TO)) {
                 if !Self::is_dir(f).await && (!f.exists() || !check_exists) {
                     if let Err(err) = Transcoder::get().transcode(f, &dst) {
                         println!("Failed to transcode {src:?} into {dst:?}: {err}");
