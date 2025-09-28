@@ -1,5 +1,6 @@
 use async_inotify::{WatchMask, Watcher as IWatcher};
 use inotify::{EventMask, WatchDescriptor};
+use log::{debug, trace, warn};
 use std::{
     collections::HashMap,
     io,
@@ -75,27 +76,37 @@ impl Watcher {
         if let Ok(suffix) = f.strip_prefix(src) {
             let dst = dst.join(suffix);
             if dst == f {
+                warn!("Source and destination are same: {f:?}");
                 return;
             }
+            trace!("Processing {event:?} on {f:?}");
             if event.intersects(EventMask::DELETE.union(EventMask::MOVED_FROM)) {
+                debug!("Removing {dst:?}");
                 if let Err(err) = Self::delete(&dst).await {
-                    println!("Failed to delete {dst:?}: {err:?}");
+                    warn!("Failed to delete {dst:?}: {err:?}");
                 }
             } else if event.intersects(
                 EventMask::CREATE
                     .union(EventMask::MOVED_TO)
                     .union(EventMask::CLOSE_WRITE),
             ) {
-                if !Self::is_dir(f).await && (!f.exists() || !check_exists) {
-                    if let Err(err) = Transcoder::get().transcode(f, &dst) {
-                        println!("Failed to transcode {src:?} into {dst:?}: {err}");
+                if Self::is_dir(f).await {
+                    trace!("Ignoring directory {f:?}")
+                } else {
+                    if dst.exists() && check_exists {
+                        trace!("Ignoring existed {f:?}")
+                    } else {
+                        debug!("Performing emplacing {f:?} to {dst:?}");
+                        if let Err(err) = Transcoder::get().transcode(f, &dst) {
+                            warn!("Failed to transcode {src:?} into {dst:?}: {err}");
+                        }
                     }
                 }
             } else {
-                println!("{:?}: {:?} -> unexpected event", event, f);
+                warn!("{:?}: {:?} -> unexpected event", event, f);
             }
         } else {
-            println!("{:?}: {:?} -> unexpected watching path", event, f);
+            warn!("{:?}: {:?} -> unexpected watching path", event, f);
         }
     }
 
@@ -106,6 +117,7 @@ impl Watcher {
     }
 
     async fn check_f(f: &Path, src: &Path, dst: &Path) {
+        trace!("Rechecking {f:?} ({src:?} -> {dst:?})");
         if Self::is_dir(f).await {
             if let Ok(mut dir) = read_dir(f).await {
                 while let Ok(f) = dir.next_entry().await {

@@ -1,4 +1,5 @@
 use ffmpeg_next::{self as ffmpeg, Codec, Stream, codec, media};
+use log::{debug, info, trace};
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -133,12 +134,36 @@ impl<'a> MediaFile<'a> {
 
 impl fmt::Debug for MediaFile<'_> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}{:?}",
-            if self.is_media() { "Media: " } else { "" },
-            self.path()
-        )
+        match self {
+            MediaFile::Input { input, path } => {
+                writeln!(f, "File  {path:?}:")?;
+                for (name, value) in input.metadata().iter() {
+                    writeln!(f, "  {name}: {value}")?;
+                }
+                for (stream_index, stream) in input.streams().enumerate() {
+                    let codec_parameters = stream.parameters();
+                    let codec_id = codec_parameters.id();
+
+                    writeln!(f, "  Stream {}:", stream_index)?;
+
+                    for (name, value) in stream.metadata().iter() {
+                        writeln!(f, "    {name}: {value}")?;
+                    }
+
+                    writeln!(f, "      Codec ID: {:?}", codec_id)?;
+
+                    if let Some(codec) = find_codec(codec_id) {
+                        writeln!(f, "      Codec Name: {}", codec.name())?;
+                        writeln!(f, "      Codec Long Name: {}", codec.description())?;
+                        writeln!(f, "      Codec Type: {:?}", codec.medium())?;
+                    } else {
+                        writeln!(f, "      Codec not found for ID: {:?}", codec_id)?;
+                    }
+                }
+            }
+            MediaFile::Other { path } => write!(f, "Unsupported {path:?}")?,
+        }
+        Ok(())
     }
 }
 
@@ -152,12 +177,15 @@ impl<'a> Transcoder<'a> {
         let src = MediaFile::new(src);
         let streams = src.streams();
         let tasks = MediaFileTasks::new(&src, &streams, &self.config);
+        trace!("{src:#?}");
         if src.is_media() {
-            println!("Transcoding tasks: {tasks:#?}");
+            debug!("Transcoding tasks: {tasks:#?}");
         }
         if tasks.need_to_transcode() {
+            info!("Performing transcoding for {:?}", src.path());
             todo!();
         } else {
+            info!("Placing symlink to {:?}", src.path());
             std::fs::create_dir_all(dst.parent().unwrap_or(Path::new("/")))?;
             std::os::unix::fs::symlink(src.path(), dst)?;
         }
@@ -168,39 +196,6 @@ impl<'a> Transcoder<'a> {
 impl TranscoderConfig {
     pub fn get<'a>() -> MutexGuard<'a, TranscoderConfig> {
         CONFIG.lock().unwrap()
-    }
-
-    pub fn need_to_transcode(&self, src: &MediaFile) -> bool {
-        match src {
-            MediaFile::Input { input, path } => {
-                println!("File  {path:?}:");
-                for (name, value) in input.metadata().iter() {
-                    println!("  {name}: {value}");
-                }
-                for (stream_index, stream) in input.streams().enumerate() {
-                    let codec_parameters = stream.parameters();
-                    let codec_id = codec_parameters.id();
-
-                    println!("  Stream {}:", stream_index);
-
-                    for (name, value) in stream.metadata().iter() {
-                        println!("    {name}: {value}");
-                    }
-
-                    println!("      Codec ID: {:?}", codec_id);
-
-                    if let Some(codec) = ffmpeg::codec::decoder::find(codec_id) {
-                        println!("      Codec Name: {}", codec.name());
-                        println!("      Codec Long Name: {}", codec.description());
-                        println!("      Codec Type: {:?}", codec.medium());
-                    } else {
-                        println!("      Codec not found for ID: {:?}", codec_id);
-                    }
-                }
-                false
-            }
-            MediaFile::Other { path: _ } => false,
-        }
     }
 }
 
