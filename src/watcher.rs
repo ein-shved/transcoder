@@ -46,7 +46,8 @@ impl Watcher {
             &WatchMask::CREATE
                 .union(WatchMask::DELETE)
                 .union(WatchMask::MOVED_TO)
-                .union(WatchMask::MOVED_FROM),
+                .union(WatchMask::MOVED_FROM)
+                .union(WatchMask::CLOSE_WRITE),
         )?;
         Self::recheck(&wp.src, &wp.dst);
         self.descriptors.insert(wd, wp);
@@ -80,7 +81,11 @@ impl Watcher {
                 if let Err(err) = Self::delete(&dst).await {
                     println!("Failed to delete {dst:?}: {err:?}");
                 }
-            } else if event.intersects(EventMask::CREATE.union(EventMask::MOVED_TO)) {
+            } else if event.intersects(
+                EventMask::CREATE
+                    .union(EventMask::MOVED_TO)
+                    .union(EventMask::CLOSE_WRITE),
+            ) {
                 if !Self::is_dir(f).await && (!f.exists() || !check_exists) {
                     if let Err(err) = Transcoder::get().transcode(f, &dst) {
                         println!("Failed to transcode {src:?} into {dst:?}: {err}");
