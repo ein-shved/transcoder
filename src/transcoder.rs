@@ -1,5 +1,6 @@
 use ffmpeg_next::{self as ffmpeg, Codec, Stream, codec, media};
 use log::{debug, info, trace};
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
@@ -9,25 +10,26 @@ pub struct Transcoder<'a> {
     config: MutexGuard<'a, TranscoderConfig>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Deserialize, Hash, Eq)]
 pub struct RequiredAudio {
     language: Option<String>,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Deserialize, Hash, Eq)]
 pub struct RequiredSubtitle {
     language: Option<String>,
 }
 
 type FileExtension = String;
 
-#[derive(Debug)]
+#[derive(Debug, Deserialize)]
 pub enum SupportedData {
     FileFormat(FileExtension),
+    #[serde(deserialize_with = "deserialize_codec_id")]
     Codec(codec::Id),
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Deserialize, Hash, Eq)]
 pub enum RequirementType {
     FileFormat,
     Video,
@@ -35,20 +37,20 @@ pub enum RequirementType {
     Subtitle(RequiredSubtitle),
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Deserialize, Hash, Eq)]
 pub enum RequirementLevel {
     All,
     AtLeastOne,
     WithOther,
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Deserialize, Hash, Eq)]
 pub struct Requirement {
     what: RequirementType,
     level: RequirementLevel,
 }
 
-#[derive(Default, Debug)]
+#[derive(Default, Debug, Deserialize)]
 pub struct TranscoderConfig {
     supported: Vec<SupportedData>,
     required: HashSet<Requirement>,
@@ -196,6 +198,10 @@ impl<'a> Transcoder<'a> {
 impl TranscoderConfig {
     pub fn get<'a>() -> MutexGuard<'a, TranscoderConfig> {
         CONFIG.lock().unwrap()
+    }
+    pub fn set(config: TranscoderConfig) {
+        let mut s = Self::get();
+        *s = config;
     }
 }
 
@@ -355,4 +361,14 @@ fn find_codec(id: codec::Id) -> Option<Codec> {
 
 fn find_codec_by_name(name: &str) -> Option<Codec> {
     codec::decoder::find_by_name(name).or_else(|| codec::encoder::find_by_name(name))
+}
+
+fn deserialize_codec_id<'de, D>(deserializer: D) -> Result<codec::Id, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let id_str = String::deserialize(deserializer)?.to_lowercase();
+    let codec = find_codec_by_name(&id_str)
+        .ok_or_else(|| serde::de::Error::custom(&format!("Unknown codec {id_str}")))?;
+    Ok(codec.id())
 }
