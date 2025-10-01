@@ -22,16 +22,8 @@ pub struct RequiredSubtitle {
 
 type FileExtension = String;
 
-#[derive(Debug, Deserialize)]
-pub enum SupportedData {
-    FileFormat(FileExtension),
-    #[serde(deserialize_with = "deserialize_codec_id")]
-    Codec(codec::Id),
-}
-
 #[derive(Debug, PartialEq, Deserialize, Hash, Eq, PartialOrd, Ord)]
 pub enum RequirementType {
-    FileFormat,
     Video,
     Audio(RequiredAudio),
     Subtitle(RequiredSubtitle),
@@ -58,7 +50,11 @@ pub struct Requirement {
 
 #[derive(Default, Debug, Deserialize)]
 pub struct TranscoderConfig {
-    supported: Vec<SupportedData>,
+    #[serde(alias = "supported-formats")]
+    supported_formats: Vec<FileExtension>,
+    #[serde(deserialize_with = "deserialize_codecs", alias = "supported-codecs")]
+    supported_codecs: Vec<codec::Id>,
+    #[serde(alias = "requirements")]
     required: BTreeSet<Requirement>,
 }
 
@@ -295,7 +291,6 @@ impl PartialEq<StreamCodec<'_>> for RequirementType {
             let media_meta = stream.stream.metadata();
             let media_lang = media_meta.get("language");
             match self {
-                Self::FileFormat => false,
                 Self::Video => media == Type::Video,
                 Self::Audio(audio) => {
                     media == Type::Audio
@@ -325,18 +320,16 @@ impl<'a> From<Stream<'a>> for StreamCodec<'a> {
 impl<'file> TranscodeTask<'file> {
     pub fn new(stream: &'file StreamCodec<'file>, config: &TranscoderConfig) -> Option<Self> {
         let mut action = None;
-        for supp in config.supported.iter() {
-            if let SupportedData::Codec(supp) = supp {
-                if let Some(codec) = stream.codec {
-                    if codec.id() == *supp {
-                        action = Some(TranscodeTaskType::Supported);
-                        break;
-                    } else if action.is_none() {
-                        let supp = find_codec(*supp);
-                        if let Some(supp) = supp {
-                            if supp.medium() == codec.medium() {
-                                action = Some(TranscodeTaskType::Transcode(supp.id()))
-                            }
+        for supp in config.supported_codecs.iter() {
+            if let Some(codec) = stream.codec {
+                if codec.id() == *supp {
+                    action = Some(TranscodeTaskType::Supported);
+                    break;
+                } else if action.is_none() {
+                    let supp = find_codec(*supp);
+                    if let Some(supp) = supp {
+                        if supp.medium() == codec.medium() {
+                            action = Some(TranscodeTaskType::Transcode(supp.id()))
                         }
                     }
                 }
@@ -435,12 +428,18 @@ fn find_codec_by_name(name: &str) -> Option<Codec> {
     codec::decoder::find_by_name(name).or_else(|| codec::encoder::find_by_name(name))
 }
 
-fn deserialize_codec_id<'de, D>(deserializer: D) -> Result<codec::Id, D::Error>
+fn deserialize_codecs<'de, D>(deserializer: D) -> Result<Vec<codec::Id>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    let id_str = String::deserialize(deserializer)?.to_lowercase();
-    let codec = find_codec_by_name(&id_str)
-        .ok_or_else(|| serde::de::Error::custom(&format!("Unknown codec {id_str}")))?;
-    Ok(codec.id())
+    let ids = Vec::<String>::deserialize(deserializer)?;
+    let mut res = Vec::<codec::Id>::new();
+    res.reserve(ids.len());
+    for id_str in ids.into_iter() {
+        let id_str = id_str.to_lowercase();
+        let codec = find_codec_by_name(&id_str)
+            .ok_or_else(|| serde::de::Error::custom(&format!("Unknown codec {id_str}")))?;
+        res.push(codec.id());
+    }
+    Ok(res)
 }
