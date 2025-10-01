@@ -42,6 +42,8 @@ pub enum RequirementLevel {
     All,
     AtLeastOne,
     WithOther,
+    Ignore,
+    Decline,
 }
 
 // Requirements are comparable to make them prioritized. One stream can be matched to several
@@ -257,7 +259,11 @@ impl<'req, 'file> RequirementTaks<'req, 'file> {
     }
     pub fn need_to_transcode(&self) -> bool {
         let level = self.get_level();
-        if level == RequirementLevel::WithOther || self.tasks.is_empty() {
+        if self.tasks.is_empty()
+            || level == RequirementLevel::WithOther
+            || level == RequirementLevel::Ignore
+            || level == RequirementLevel::Decline
+        {
             return false;
         }
         for task in self.tasks.iter() {
