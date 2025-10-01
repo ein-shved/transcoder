@@ -50,7 +50,7 @@ pub struct Requirement {
 
 #[derive(Default, Debug, Deserialize)]
 pub struct TranscoderConfig {
-    #[serde(alias = "supported-formats")]
+    #[serde(deserialize_with = "deserialize_formats", alias = "supported-formats")]
     supported_formats: Vec<FileExtension>,
     #[serde(deserialize_with = "deserialize_codecs", alias = "supported-codecs")]
     supported_codecs: Vec<codec::Id>,
@@ -73,6 +73,8 @@ enum MediaFile<'a> {
 
 #[derive(Debug)]
 struct MediaFileTasks<'req, 'file> {
+    file: &'file MediaFile<'file>,
+    config: &'req TranscoderConfig,
     tasks: Vec<RequirementTaks<'req, 'file>>,
 }
 
@@ -132,6 +134,14 @@ impl<'a> MediaFile<'a> {
         match self {
             Self::Input { input: _, path: _ } => true,
             _ => false,
+        }
+    }
+
+    pub fn get_format(&self) -> Option<String> {
+        if let Some(s) = self.path().extension() {
+            s.to_str().map(str::to_lowercase)
+        } else {
+            None
         }
     }
 }
@@ -220,10 +230,22 @@ impl<'req, 'file> MediaFileTasks<'req, 'file> {
                 file, config, &streams, req,
             ));
         }
-        Self { tasks }
+        Self { file, config, tasks }
     }
 
     pub fn need_to_transcode(&self) -> bool {
+        if let Some(format) = self.file.get_format()
+        {
+            let mut format_supported = false;
+            for supp in self.config.supported_formats.iter() {
+                if *supp == format {
+                    format_supported = true;
+                }
+            }
+            if !format_supported {
+                return true;
+            }
+        }
         for task in self.tasks.iter() {
             if task.need_to_transcode() {
                 return true;
@@ -442,4 +464,14 @@ where
         res.push(codec.id());
     }
     Ok(res)
+}
+
+fn deserialize_formats<'de, D>(deserializer: D) -> Result<Vec<FileExtension>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Vec::<FileExtension>::deserialize(deserializer)?
+        .into_iter()
+        .map(|s| s.to_lowercase())
+        .collect())
 }
