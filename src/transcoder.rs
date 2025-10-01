@@ -1,7 +1,7 @@
 use ffmpeg_next::{self as ffmpeg, Codec, Stream, codec, media};
 use log::{debug, info, trace};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 use std::{fmt, io};
@@ -10,12 +10,12 @@ pub struct Transcoder<'a> {
     config: MutexGuard<'a, TranscoderConfig>,
 }
 
-#[derive(Debug, PartialEq, Deserialize, Hash, Eq)]
+#[derive(Debug, Deserialize, Hash)]
 pub struct RequiredAudio {
     language: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Deserialize, Hash, Eq)]
+#[derive(Debug, Deserialize, Hash)]
 pub struct RequiredSubtitle {
     language: Option<String>,
 }
@@ -29,7 +29,7 @@ pub enum SupportedData {
     Codec(codec::Id),
 }
 
-#[derive(Debug, PartialEq, Deserialize, Hash, Eq)]
+#[derive(Debug, PartialEq, Deserialize, Hash, Eq, PartialOrd, Ord)]
 pub enum RequirementType {
     FileFormat,
     Video,
@@ -37,14 +37,18 @@ pub enum RequirementType {
     Subtitle(RequiredSubtitle),
 }
 
-#[derive(Debug, PartialEq, Clone, Copy, Deserialize, Hash, Eq)]
+#[derive(Debug, PartialEq, Clone, Copy, Deserialize, Hash, Eq, PartialOrd, Ord)]
 pub enum RequirementLevel {
     All,
     AtLeastOne,
     WithOther,
 }
 
-#[derive(Debug, PartialEq, Deserialize, Hash, Eq)]
+// Requirements are comparable to make them prioritized. One stream can be matched to several
+// requirements. E.g. requirement with language=Some(rus) and level=All and another requirement
+// with language=None and level=WithOther. In such case we should follow the most accurate
+// requirement
+#[derive(Debug, PartialEq, Deserialize, Hash, Eq, PartialOrd, Ord)]
 pub struct Requirement {
     what: RequirementType,
     level: RequirementLevel,
@@ -53,7 +57,7 @@ pub struct Requirement {
 #[derive(Default, Debug, Deserialize)]
 pub struct TranscoderConfig {
     supported: Vec<SupportedData>,
-    required: HashSet<Requirement>,
+    required: BTreeSet<Requirement>,
 }
 
 static CONFIG: LazyLock<Mutex<TranscoderConfig>> =
@@ -351,6 +355,68 @@ impl fmt::Debug for StreamCodec<'_> {
             )
         } else {
             write!(f, "{{Unsupported stream {}}}", self.stream.id())
+        }
+    }
+}
+
+// Reverting ordering for Requirements with optional fields to make one with Some to be less then
+// one with None field to make them greater priority.
+//
+// While we are implementing Ord manually - we have to implement other 3 traits manually to as it
+// said in std::cmp documentation
+impl Ord for RequiredAudio {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        prioritize(&self.language, &other.language)
+    }
+}
+
+impl PartialOrd for RequiredAudio {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RequiredAudio {
+    fn eq(&self, other: &Self) -> bool {
+        self.language == other.language
+    }
+}
+
+impl Eq for RequiredAudio {}
+
+impl Ord for RequiredSubtitle {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        prioritize(&self.language, &other.language)
+    }
+}
+
+impl PartialOrd for RequiredSubtitle {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for RequiredSubtitle {
+    fn eq(&self, other: &Self) -> bool {
+        self.language == other.language
+    }
+}
+
+impl Eq for RequiredSubtitle {}
+
+fn prioritize<T: Ord>(lh: &Option<T>, rh: &Option<T>) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    if let Some(lh) = lh {
+        if let Some(rh) = rh {
+            lh.cmp(rh)
+        } else {
+            Ordering::Less
+        }
+    } else {
+        if rh.is_none() {
+            Ordering::Equal
+        } else {
+            Ordering::Greater
         }
     }
 }
