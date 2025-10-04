@@ -84,13 +84,13 @@ struct RequirementTaks<'req, 'file> {
     tasks: Vec<TranscodeTask<'file>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct TranscodeTask<'file> {
     stream: &'file StreamCodec<'file>,
     action: TranscodeTaskType,
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(PartialEq, Debug, Clone)]
 enum TranscodeTaskType {
     Supported,
     Transcode(codec::Id),
@@ -197,6 +197,8 @@ impl<'a> Transcoder<'a> {
         }
         if tasks.need_to_transcode() {
             info!("Performing transcoding for {:?}", src.path());
+            let tasks = tasks.make_program(&streams);
+            trace!("Will do: {tasks:?}");
             todo!();
         } else {
             info!("Placing symlink to {:?}", src.path());
@@ -252,6 +254,27 @@ impl<'req, 'file> MediaFileTasks<'req, 'file> {
             }
         }
         false
+    }
+    pub fn make_program(&self, streams: &'file Streams<'file>) -> Vec<TranscodeTask<'file>>
+    {
+        let mut res = Vec::new();
+        for stream in streams.iter() {
+            for task in self.tasks.iter() {
+                let mut final_task = None;
+                for task in task.tasks.iter() {
+                    if task.stream.stream == stream.stream {
+                        final_task = Some(task.clone());
+                        break;
+                    }
+                }
+                if let Some(task) = final_task {
+                    res.push(task);
+                    break
+                }
+            }
+
+        }
+        res
     }
 }
 
