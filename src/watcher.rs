@@ -4,7 +4,7 @@ use log::{debug, trace, warn};
 use std::{
     collections::HashMap,
     io,
-    path::{Path, PathBuf},
+    path::{self, Path, PathBuf},
     str::FromStr,
 };
 use tokio::fs::{metadata, read_dir, remove_dir_all, remove_file, symlink_metadata};
@@ -33,6 +33,15 @@ impl FromStr for WatchPair {
     }
 }
 
+impl WatchPair {
+    pub fn absolute(self) -> io::Result<Self> {
+        Ok(Self {
+            src: path::absolute(self.src)?,
+            dst: path::absolute(self.dst)?,
+        })
+    }
+}
+
 impl Watcher {
     pub fn new() -> Self {
         Self {
@@ -42,6 +51,7 @@ impl Watcher {
     }
 
     pub fn add(&mut self, wp: WatchPair) -> async_inotify::Result<()> {
+        let wp = wp.absolute()?;
         let wd = self.watcher.add(
             &wp.src,
             &WatchMask::CREATE
