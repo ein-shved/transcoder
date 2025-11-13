@@ -53,6 +53,8 @@ async fn main() {
     debug!("Configuration: {config:#?}");
     TranscoderConfig::set(config);
 
+    ffmpeg_next::init().unwrap();
+    ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Debug);
     let mut watcher = Watcher::new();
     for pair in std::iter::once(args.pair).chain(args.pairs.into_iter()) {
         info!("Watching {:?} -> {:?}", pair.src, pair.dst);

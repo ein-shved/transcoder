@@ -1,6 +1,6 @@
 use ffmpeg_next::codec::Context;
 use ffmpeg_next::format::context;
-use ffmpeg_next::{self as ffmpeg, Codec, Packet, Stream, StreamMut, codec, media};
+use ffmpeg_next::{self as ffmpeg, Codec, Packet, Stream, StreamMut, codec, encoder, media};
 use log::{debug, trace};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
@@ -105,7 +105,9 @@ struct RequirementTaks<'req> {
 
 struct TranscodePair {
     decoder: Box<dyn DerefMut<Target = ffmpeg::decoder::Opened>>,
-    encoder: Box<dyn DerefMut<Target = ffmpeg::encoder::Encoder>>,
+    encoder: Box<dyn DerefToEncoder>,
+    resempler: Option<ffmpeg::software::resampling::Context>,
+    output_index: usize,
 }
 
 struct StreamOutputTask {
@@ -171,14 +173,19 @@ impl TranscoderImpl<(&Path, &Path)> for context::Input {
                 dst.to_owned()
             };
             let dst_ctx = ffmpeg::format::output(&dst_p)?;
-            let mut tasks = MediaOutputTasks::new(tasks, &self, dst_ctx);
+            let mut tasks = MediaOutputTasks::new(tasks, &self, dst_ctx)?;
             tasks.dst.set_metadata(self.metadata().to_owned());
             let res = tasks.transcode(&mut self);
             if res.is_ok() {
+                debug!("Transcoding {:?} -> {:?} successful", src, dst);
                 res
             } else {
                 _ = fs::remove_file(dst_p);
                 if config.backup_symlink {
+                    debug!(
+                        "Transcoding {:?} -> {:?} failed! Backuping with symlink",
+                        src, dst
+                    );
                     _ = src.transcode(dst, config);
                 }
                 res
@@ -300,7 +307,11 @@ impl<'req> MediaFileTasks<'req> {
 }
 
 impl MediaOutputTasks {
-    pub fn new(tasks: MediaFileTasks<'_>, src: &context::Input, mut dst: context::Output) -> Self {
+    pub fn new(
+        tasks: MediaFileTasks<'_>,
+        src: &context::Input,
+        mut dst: context::Output,
+    ) -> io::Result<Self> {
         let mut output_tasks = HashMap::default();
         for stream in src.streams() {
             let mut final_task = None;
@@ -318,13 +329,13 @@ impl MediaOutputTasks {
             let codec = find_codec(stream.parameters().id());
             output_tasks.insert(
                 stream.index(),
-                StreamOutputTask::new(stream, codec, &mut dst, final_task),
+                StreamOutputTask::new(stream, codec, &mut dst, final_task)?,
             );
         }
-        Self {
+        Ok(Self {
             dst,
             tasks: output_tasks,
-        }
+        })
     }
     pub fn transcode(&mut self, src: &mut context::Input) -> io::Result<()> {
         self.dst.write_header()?;
@@ -332,8 +343,11 @@ impl MediaOutputTasks {
         for (stream, packet) in src.packets() {
             let task = self.tasks.get_mut(&stream.index());
             if let Some(task) = task {
-                task.transcode(packet, &mut self.dst)?;
+                task.process_packet(packet, &mut self.dst)?;
             }
+        }
+        for (_, task) in self.tasks.iter_mut() {
+            task.send_eof(&mut self.dst)?;
         }
 
         self.dst.write_trailer()?;
@@ -347,89 +361,184 @@ impl StreamOutputTask {
         decodec: Option<Codec>,
         dst: &mut context::Output,
         task: Option<TranscodeTask>,
-    ) -> Self {
+    ) -> io::Result<Self> {
         let encodec = task.and_then(|task| match task.action {
             TranscodeTaskType::Supported => None,
             TranscodeTaskType::Transcode(codec) => Some(codec),
         });
         let need_to_transcode = encodec.is_some() && decodec.is_some();
         let encodec = encodec.or(decodec);
+        // TODO: Remove
+        // let encodec = decodec;
+        // need_to_transcode = false;
 
-        let mut output_stream = dst.add_stream(encodec.clone()).unwrap();
+        let encodec = encodec.map(|e| ffmpeg::encoder::find(e.id()).unwrap() );
+        trace!(
+            "New output task: {:?} -> {:?}",
+            decodec.map(|e| e.name().to_owned()),
+            encodec.map(|e| e.name().to_owned())
+        );
+         let mut output_stream = dst.add_stream(encodec.clone())?;
+        //let mut output_stream = dst.add_stream(decodec.clone())?;
+        debug!("Encodec1: {:?}", output_stream.parameters().id());
         let output_index = output_stream.index();
 
-        if need_to_transcode {
-        } else {
+        if !need_to_transcode {
             output_stream.set_parameters(stream.parameters());
         }
+        debug!("Encodec2: {:?}", output_stream.parameters().id());
+        output_stream.set_metadata(stream.metadata().to_owned());
+        debug!("Encodec3: {:?}", output_stream.parameters().id());
         let transcoder = if need_to_transcode {
             Some(TranscodePair::new(
                 &stream,
-                output_stream,
+                &mut output_stream,
                 decodec.unwrap(),
                 encodec.unwrap(),
-            ))
+            )?)
         } else {
             None
         };
 
-        Self {
+        Ok(Self {
             transcoder,
             output_index,
             input_index: stream.index(),
-        }
+        })
     }
 
-    pub fn transcode(&mut self, mut packet: Packet, dst: &mut context::Output) -> io::Result<()> {
+    pub fn process_packet(
+        &mut self,
+        mut packet: Packet,
+        dst: &mut context::Output,
+    ) -> io::Result<()> {
         if let Some(ref mut transcoder) = self.transcoder {
-            transcoder.decoder.send_packet(&packet)?;
+            debug!("Transcode 1");
+            transcoder.process_packet(packet, dst)?;
+            debug!("Transcode 2");
         } else {
             packet.set_stream(self.output_index);
             packet.write(dst)?;
         }
         Ok(())
     }
+    pub fn send_eof(&mut self, dst: &mut context::Output) -> io::Result<()> {
+        if let Some(ref mut transcoder) = self.transcoder {
+            transcoder.send_eof(dst)?;
+        }
+        Ok(())
+    }
 }
 
 impl TranscodePair {
-    pub fn new(src: &Stream<'_>, mut dst: StreamMut, decodec: Codec, encodec: Codec) -> Self {
-        let context = Context::from_parameters(src.parameters()).unwrap();
-        let decoder = context.decoder();
-        let context = Context::from_parameters(dst.parameters()).unwrap();
-        let mut encoder = context.encoder();
+    pub fn new(
+        src: &Stream<'_>,
+        dst: &mut StreamMut,
+        decodec: Codec,
+        encodec: Codec,
+    ) -> io::Result<Self> {
+        let encodec = decodec;
+        let decoder = Context::from_parameters(src.parameters())?.decoder();
+        debug!("Encodec: {:?}", dst.parameters().id());
+        let encodec = find_codec(dst.parameters().id()).unwrap();
+
+        let mut encoder = Context::new_with_codec(encodec).encoder();
 
         encoder.set_frame_rate(Some(decoder.frame_rate()));
+        dst.set_parameters(&encoder);
 
         let res = match decodec.medium() {
             media::Type::Audio => {
-                let mut en_audio = encoder.audio().unwrap();
-                let mut de_audio = decoder.audio().unwrap();
+                let mut en_audio = encoder.audio()?;
+                let mut de_audio = decoder.audio()?;
+                let encodec = encodec.audio()?;
                 let channel_layout = encodec
-                    .audio()
-                    .unwrap()
+                    .audio()?
                     .channel_layouts()
                     .map(|cls| cls.best(de_audio.channel_layout().channels()))
                     .unwrap_or(ffmpeg::channel_layout::ChannelLayout::STEREO);
-                de_audio.set_parameters(src.parameters()).unwrap();
+                de_audio.set_parameters(src.parameters())?;
 
                 en_audio.set_rate(de_audio.rate() as i32);
                 en_audio.set_channel_layout(channel_layout);
                 en_audio.set_bit_rate(de_audio.bit_rate());
+                en_audio.set_max_bit_rate(de_audio.max_bit_rate());
+                en_audio.set_format(
+                    encodec
+                        .formats()
+                        .ok_or(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Can not get available formats of audio codec",
+                        ))?
+                        .next()
+                        .ok_or(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "Audio codec contains no formats",
+                        ))?,
+                );
 
-                en_audio.set_time_base(de_audio.time_base());
+                en_audio.set_channel_layout(de_audio.channel_layout());
 
-                dst.set_time_base(en_audio.time_base());
+                en_audio.set_time_base((1, de_audio.rate() as i32));
+                dst.set_time_base((1, de_audio.rate() as i32));
+                dst.set_parameters(&en_audio);
+
+                debug!(
+                    "Encoder: format={:?}, channels={:?}, rate={:?}, layout={:?} bitrate={} time_base={}",
+                    en_audio.format(),
+                    en_audio.channels(),
+                    en_audio.rate(),
+                    en_audio.channel_layout(),
+                    unsafe { (*en_audio.as_mut_ptr()).bit_rate },
+                    en_audio.time_base()
+                );
+                debug!("Encodec: {:?}", encodec.name());
+                debug!("IsOpen: {}", unsafe {
+                    ffmpeg_next::ffi::avcodec_is_open(en_audio.as_mut_ptr())
+                });
+
+                let mut en_audio = en_audio.open()?;
+                // let mut en_audio = en_audio.open_as(encodec)?;
+                debug!("IsOpen: {}", unsafe {
+                    ffmpeg_next::ffi::avcodec_is_open(en_audio.as_mut_ptr())
+                });
+                debug!(
+                    "Encoder2: format={:?}, channels={:?}, rate={:?}, layout={:?} bitrate={} time_base={}",
+                    en_audio.format(),
+                    en_audio.channels(),
+                    en_audio.rate(),
+                    en_audio.channel_layout(),
+                    unsafe { (*en_audio.as_mut_ptr()).bit_rate },
+                    en_audio.time_base()
+                );
+                debug!("Encodec2: {:?}", en_audio.codec().unwrap().name());
+                let resempler = ffmpeg::software::resampler(
+                    (
+                        de_audio.format(),
+                        de_audio.channel_layout(),
+                        de_audio.rate(),
+                    ),
+                    (
+                        en_audio.format(),
+                        en_audio.channel_layout(),
+                        en_audio.rate(),
+                    ),
+                )?;
 
                 Self {
                     decoder: Box::new(de_audio),
                     encoder: Box::new(en_audio),
+                    resempler: None,
+                    // resempler: Some(resempler),
+                    output_index: dst.index(),
                 }
             }
             media::Type::Video => {
-                let mut en_video = encoder.video().unwrap();
-                let mut de_video = decoder.video().unwrap();
+                let mut en_video = encoder.video()?;
+                let mut de_video = decoder.video()?;
 
-                de_video.set_parameters(src.parameters()).unwrap();
+                de_video.set_parameters(src.parameters())?;
+                en_video.set_parameters(src.parameters())?;
                 en_video.set_format(de_video.format());
                 en_video.set_height(de_video.height());
                 en_video.set_width(de_video.width());
@@ -437,28 +546,126 @@ impl TranscodePair {
                 en_video.set_colorspace(de_video.color_space());
                 en_video.set_color_range(de_video.color_range());
 
+                let en_video = en_video.open()?;
                 Self {
                     decoder: Box::new(de_video),
                     encoder: Box::new(en_video),
+                    resempler: None,
+                    output_index: dst.index(),
                 }
             }
             media::Type::Subtitle => {
-                let en_sub = encoder.subtitle().unwrap();
-                let mut de_sub = decoder.subtitle().unwrap();
+                let mut en_sub = encoder.subtitle()?;
+                let mut de_sub = decoder.subtitle()?;
 
-                de_sub.set_parameters(src.parameters()).unwrap();
+                de_sub.set_parameters(src.parameters())?;
+                en_sub.set_parameters(src.parameters())?;
 
+                let mut en_sub = en_sub.open()?;
                 Self {
                     decoder: Box::new(de_sub),
                     encoder: Box::new(en_sub),
+                    resempler: None,
+                    output_index: dst.index(),
                 }
             }
             _ => {
                 panic!("Do not know how to transcode stream");
             }
         };
-        dst.set_parameters(res.encoder.deref() as &ffmpeg::encoder::Encoder);
-        res
+        Ok(res)
+    }
+
+    pub fn process_packet(&mut self, packet: Packet, dst: &mut context::Output) -> io::Result<()> {
+        debug!("Transcode 2");
+        self.decoder.send_packet(&packet)?;
+        debug!("Transcode 2.1");
+        self.decode(dst)?;
+        debug!("Transcode 2.2");
+        Ok(())
+    }
+
+    pub fn decode(&mut self, dst: &mut context::Output) -> io::Result<()> {
+        let mut decoded = ffmpeg::frame::Audio::empty();
+        while self.decoder.receive_frame(&mut decoded).is_ok() {
+            let timestamp = decoded.timestamp();
+            decoded.set_pts(timestamp);
+            debug!("Transcode 3");
+            debug!(
+                "Decoded: format={:?}, channels={:?}, rate={:?}, layout={:?}, ts={:?}",
+                decoded.format(),
+                decoded.channels(),
+                decoded.rate(),
+                decoded.channel_layout(),
+                decoded.timestamp(),
+            );
+                debug!("IsOpen: {}", unsafe {
+                    ffmpeg_next::ffi::avcodec_is_open(self.encoder.deref_mut_to_encoder().as_mut_ptr())
+                });
+            if let Some(resempler) = self.resempler.as_mut() {
+                debug!("Transcode 3.1");
+                let mut resempled = ffmpeg::frame::Audio::empty();
+                resempler.run(&decoded, &mut resempled)?;
+            debug!(
+                "Resempled: format={:?}, channels={:?}, rate={:?}, layout={:?}, ts={:?}",
+                resempled.format(),
+                resempled.channels(),
+                resempled.rate(),
+                resempled.channel_layout(),
+                resempled.timestamp(),
+            );
+                debug!("Transcode 3.2");
+                self.encoder.deref_mut_to_encoder().send_frame(&resempled)?;
+                debug!("Transcode 3.3");
+            } else {
+                debug!("Transcode 3.4");
+                self.encoder.deref_mut_to_encoder().send_frame(&decoded)?;
+                debug!("Transcode 3.5");
+            }
+            self.encode(dst)?;
+            debug!("Transcode 3.6");
+        }
+        Ok(())
+    }
+    pub fn encode(&mut self, dst: &mut context::Output) -> io::Result<()> {
+        let mut encoded = ffmpeg::Packet::empty();
+        while self
+            .encoder
+            .deref_mut_to_encoder()
+            .receive_packet(&mut encoded)
+            .is_ok()
+        {
+            encoded.set_stream(self.output_index);
+            encoded.write(dst)?;
+        }
+        Ok(())
+    }
+    pub fn send_eof(&mut self, dst: &mut context::Output) -> io::Result<()> {
+        self.decoder.send_eof()?;
+        self.decode(dst)?;
+        Ok(())
+    }
+}
+
+trait DerefToEncoder {
+    fn deref_mut_to_encoder(&mut self) -> &mut ffmpeg::encoder::Encoder;
+}
+
+impl DerefToEncoder for ffmpeg::encoder::audio::Encoder {
+    fn deref_mut_to_encoder(&mut self) -> &mut ffmpeg_next::encoder::Encoder {
+        self
+    }
+}
+
+impl DerefToEncoder for ffmpeg::encoder::video::Encoder {
+    fn deref_mut_to_encoder(&mut self) -> &mut ffmpeg_next::encoder::Encoder {
+        self
+    }
+}
+
+impl DerefToEncoder for ffmpeg::encoder::subtitle::Encoder {
+    fn deref_mut_to_encoder(&mut self) -> &mut ffmpeg_next::encoder::Encoder {
+        self
     }
 }
 
