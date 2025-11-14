@@ -6,13 +6,14 @@ use transcoder;
 #[derive(Parser, Debug)]
 struct Args {
     input: PathBuf,
-    output: PathBuf
+    output: PathBuf,
 }
 
-fn main() {
+fn main() -> Result<(), ffmpeg_next::Error> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     let args = Args::parse();
 
-    todo!()
+    transcoder::transcode(&args.input, &args.output)?;
 
+    Ok(())
 }
