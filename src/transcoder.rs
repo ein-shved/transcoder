@@ -1,4 +1,7 @@
+use ez_ffmpeg::AVMediaType;
 use ez_ffmpeg::codec::{self as ffcodec, CodecInfo};
+use ez_ffmpeg::stream_info::{StreamInfo, find_all_stream_infos};
+use ffmpeg_sys_next::AVCodecID;
 use log::{debug, trace};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
@@ -82,9 +85,11 @@ pub struct CodecInfoExtra {
 static CODECS: LazyLock<RwLock<IndexedCodecs>> =
     LazyLock::new(|| RwLock::new(IndexedCodecs::new()));
 
+#[derive(Debug)]
 enum MediaFile<'a> {
     Input {
-        // input: context::Input,
+        input: Streams,
+        config: &'a TranscoderConfig,
         path: &'a Path,
     },
     Other {
@@ -106,7 +111,7 @@ struct RequirementTaks<'req> {
 
 #[derive(Debug, Clone)]
 struct TranscodeTask {
-    stream_index: usize,
+    stream_index: i32,
     action: TranscodeTaskType,
 }
 
@@ -116,15 +121,35 @@ enum TranscodeTaskType {
     Transcode(CodecInfoExtra),
 }
 
-impl<'a> MediaFile<'a> {
-    pub fn new(path: &'a Path) -> Self {
-        todo!();
-    }
+trait Transcodable {
+    fn transcode(self, dst: &Path) -> io::Result<()>;
 }
 
-impl fmt::Debug for MediaFile<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        todo!();
+trait GetAVCodec {
+    fn get_avcodec(&self) -> Option<AVCodecID>;
+}
+
+trait GetAVMediaType {
+    fn get_avmediatype(&self) -> AVMediaType;
+}
+
+trait GetIndex {
+    fn get_index(&self) -> i32;
+}
+
+type Streams = Vec<StreamInfo>;
+
+impl<'a> MediaFile<'a> {
+    pub fn new(path: &'a Path, config: &'a TranscoderConfig) -> Self {
+        if let Ok(streams) = find_all_stream_infos(path.as_os_str().to_str().unwrap()) {
+            Self::Input {
+                input: streams,
+                config,
+                path,
+            }
+        } else {
+            Self::Other { path }
+        }
     }
 }
 
@@ -135,7 +160,39 @@ impl<'a> Transcoder<'a> {
         }
     }
     pub fn transcode(self, src: &Path, dst: &Path) -> io::Result<()> {
-        todo!();
+        MediaFile::new(src, &self.config).transcode(dst)
+    }
+}
+
+impl Transcodable for MediaFile<'_> {
+    fn transcode(self, dst: &Path) -> io::Result<()> {
+        match self {
+            Self::Input {
+                input,
+                config,
+                path,
+            } => (input, config, path).transcode(dst),
+            Self::Other { path } => path.transcode(dst),
+        }
+    }
+}
+
+impl Transcodable for &Path {
+    fn transcode(self, dst: &Path) -> io::Result<()> {
+        std::fs::create_dir_all(dst.parent().unwrap_or(Path::new("/")))?;
+        std::os::unix::fs::symlink(self, dst)
+    }
+}
+
+impl Transcodable for (Streams, &TranscoderConfig, &Path) {
+    fn transcode(self, dst: &Path) -> io::Result<()> {
+        let (streams, config, src) = self;
+        let tasks = MediaFileTasks::new(&streams, config);
+        if tasks.need_to_transcode(src) {
+            todo!()
+        } else {
+            src.transcode(dst)
+        }
     }
 }
 
@@ -233,34 +290,34 @@ impl IndexedCodecs {
 }
 
 impl<'req> MediaFileTasks<'req> {
-    // pub fn new(streams: &Streams, config: &'req TranscoderConfig) -> Self {
-    //     let mut tasks = vec![];
-    //
-    //     for req in config.required.iter() {
-    //         tasks.push(RequirementTaks::<'req>::new(config, streams, req));
-    //     }
-    //     Self { config, tasks }
-    // }
-    //
-    // pub fn need_to_transcode(&self, src: &Path) -> bool {
-    //     if let Some(format) = get_format(src) {
-    //         let mut format_supported = false;
-    //         for supp in self.config.supported_formats.iter() {
-    //             if *supp == format {
-    //                 format_supported = true;
-    //             }
-    //         }
-    //         if !format_supported {
-    //             return true;
-    //         }
-    //     }
-    //     for task in self.tasks.iter() {
-    //         if task.need_to_transcode() {
-    //             return true;
-    //         }
-    //     }
-    //     false
-    // }
+    pub fn new(streams: &Streams, config: &'req TranscoderConfig) -> Self {
+        let mut tasks = vec![];
+
+        for req in config.required.iter() {
+            tasks.push(RequirementTaks::<'req>::new(config, streams, req));
+        }
+        Self { config, tasks }
+    }
+
+    pub fn need_to_transcode(&self, src: &Path) -> bool {
+        if let Some(format) = get_format(src) {
+            let mut format_supported = false;
+            for supp in self.config.supported_formats.iter() {
+                if *supp == format {
+                    format_supported = true;
+                }
+            }
+            if !format_supported {
+                return true;
+            }
+        }
+        for task in self.tasks.iter() {
+            if task.need_to_transcode() {
+                return true;
+            }
+        }
+        false
+    }
     // fn make_program<'a>(&self, src: Streams<'a>, dst: &mut context::Output) -> Vec<ProgramTask<'a>> {
     //     src.into_iter().filter_map(|stream| {
     //         self.make_task_for(stream, dst)
@@ -328,77 +385,78 @@ impl<'req> MediaFileTasks<'req> {
 }
 
 impl<'req> RequirementTaks<'req> {
-    // pub fn new(
-    //     config: &'req TranscoderConfig,
-    //     streams: &Streams,
-    //     requirement: &'req Requirement,
-    // ) -> Self {
-    //     let mut tasks = Vec::<TranscodeTask>::default();
-    //     for stream in streams.iter() {
-    //         if *requirement == *stream {
-    //             if let Some(task) = TranscodeTask::new(stream, config) {
-    //                 tasks.push(task);
-    //             }
-    //         }
-    //     }
-    //     Self { requirement, tasks }
-    // }
-    // pub fn get_level(&self) -> RequirementLevel {
-    //     self.requirement.level
-    // }
-    // pub fn need_to_transcode(&self) -> bool {
-    //     let level = self.get_level();
-    //     if self.tasks.is_empty()
-    //         || level == RequirementLevel::WithOther
-    //         || level == RequirementLevel::Ignore
-    //         || level == RequirementLevel::Decline
-    //     {
-    //         return false;
-    //     }
-    //     for task in self.tasks.iter() {
-    //         if task.need_to_transcode() {
-    //             if level == RequirementLevel::All {
-    //                 return true;
-    //             }
-    //         } else {
-    //             if level == RequirementLevel::AtLeastOne {
-    //                 return false;
-    //             }
-    //         }
-    //     }
-    //     return level == RequirementLevel::AtLeastOne;
-    // }
+    pub fn new(
+        config: &'req TranscoderConfig,
+        streams: &Streams,
+        requirement: &'req Requirement,
+    ) -> Self {
+        let mut tasks = Vec::<TranscodeTask>::default();
+        for stream in streams.iter() {
+            if *requirement == *stream {
+                if let Some(task) = TranscodeTask::new(stream, config) {
+                    tasks.push(task);
+                }
+            }
+        }
+        Self { requirement, tasks }
+    }
+    pub fn get_level(&self) -> RequirementLevel {
+        self.requirement.level
+    }
+    pub fn need_to_transcode(&self) -> bool {
+        let level = self.get_level();
+        if self.tasks.is_empty()
+            || level == RequirementLevel::WithOther
+            || level == RequirementLevel::Ignore
+            || level == RequirementLevel::Decline
+        {
+            return false;
+        }
+        for task in self.tasks.iter() {
+            if task.need_to_transcode() {
+                if level == RequirementLevel::All {
+                    return true;
+                }
+            } else {
+                if level == RequirementLevel::AtLeastOne {
+                    return false;
+                }
+            }
+        }
+        return level == RequirementLevel::AtLeastOne;
+    }
 }
 
-// impl PartialEq<StreamCodec<'_>> for Requirement {
-//     fn eq(&self, stream: &StreamCodec<'_>) -> bool {
-//         self.what == *stream
-//     }
-// }
-//
-// impl PartialEq<StreamCodec<'_>> for RequirementType {
-//     fn eq(&self, stream: &StreamCodec<'_>) -> bool {
-//         use media::Type;
-//         if let Some(ref codec) = stream.codec {
-//             let media = codec.medium();
-//             let media_meta = stream.stream.metadata();
-//             let media_lang = media_meta.get("language");
-//             match self {
-//                 Self::Video => media == Type::Video,
-//                 Self::Audio(audio) => {
-//                     media == Type::Audio
-//                         && (audio.language.is_none() || media_lang == audio.language.as_deref())
-//                 }
-//                 Self::Subtitle(subs) => {
-//                     media == Type::Subtitle
-//                         && (subs.language.is_none() || media_lang == subs.language.as_deref())
-//                 }
-//             }
-//         } else {
-//             false
-//         }
-//     }
-// }
+impl PartialEq<StreamInfo> for Requirement {
+    fn eq(&self, stream: &StreamInfo) -> bool {
+        self.what == *stream
+    }
+}
+
+impl PartialEq<StreamInfo> for RequirementType {
+    fn eq(&self, stream: &StreamInfo) -> bool {
+        match self {
+            Self::Video => match stream {
+                StreamInfo::Video { .. } => true,
+                _ => false,
+            },
+            Self::Audio(audio) => match stream {
+                StreamInfo::Audio { metadata, .. } => {
+                    let media_lang = metadata.get("language");
+                    audio.language.is_none() || media_lang == audio.language.as_ref()
+                }
+                _ => false,
+            },
+            Self::Subtitle(subs) => match stream {
+                StreamInfo::Subtitle { metadata, .. } => {
+                    let media_lang = metadata.get("language");
+                    subs.language.is_none() || media_lang == subs.language.as_ref()
+                }
+                _ => false,
+            },
+        }
+    }
+}
 
 // impl<'a> From<(Stream<'a>, Packet)> for StreamCodec<'a> {
 //     fn from(pair: (Stream<'a>, Packet)) -> Self {
@@ -416,28 +474,31 @@ impl<'req> RequirementTaks<'req> {
 // }
 
 impl<'file> TranscodeTask {
-    // pub fn new(stream: &'file StreamCodec<'file>, config: &TranscoderConfig) -> Option<Self> {
-    //     let mut action = None;
-    //     for supp in config.supported_codecs.iter() {
-    //         if let Some(codec) = stream.codec {
-    //             if codec == *supp {
-    //                 action = Some(TranscodeTaskType::Supported);
-    //                 break;
-    //             } else if action.is_none() {
-    //                 if supp.medium() == codec.medium() {
-    //                     action = Some(TranscodeTaskType::Transcode(*supp))
-    //                 }
-    //             }
-    //         }
-    //     }
-    //     action.map(|action| Self {
-    //         action,
-    //         stream_index: stream.stream.index(),
-    //     })
-    // }
-    // pub fn need_to_transcode(&self) -> bool {
-    //     return self.action != TranscodeTaskType::Supported;
-    // }
+    pub fn new(stream: &StreamInfo, config: &TranscoderConfig) -> Option<Self> {
+        let mut action = None;
+        for supp in config.supported_codecs.iter() {
+            if let Some(codec) = stream.get_avcodec() {
+                if codec == supp.codec_id {
+                    action = Some(TranscodeTaskType::Supported);
+                    break;
+                } else if action.is_none() {
+                    if supp.media_type == stream.get_avmediatype() &&
+                        // We are able to transcode only in case our codec supports both decoding
+                        // and encoding
+                        supp.decoder && supp.encoder {
+                        action = Some(TranscodeTaskType::Transcode(supp.clone()))
+                    }
+                }
+            }
+        }
+        action.map(|action| Self {
+            stream_index: stream.get_index(),
+            action,
+        })
+    }
+    pub fn need_to_transcode(&self) -> bool {
+        return self.action != TranscodeTaskType::Supported;
+    }
 }
 
 impl fmt::Debug for TranscodeTaskType {
@@ -572,5 +633,55 @@ impl Deref for CodecInfoExtra {
 impl PartialEq for CodecInfoExtra {
     fn eq(&self, other: &Self) -> bool {
         self.codec_name == other.codec_name
+    }
+}
+
+impl GetAVCodec for CodecInfo {
+    fn get_avcodec(&self) -> Option<AVCodecID> {
+        Some(self.codec_id)
+    }
+}
+impl GetAVCodec for StreamInfo {
+    fn get_avcodec(&self) -> Option<AVCodecID> {
+        match self {
+            Self::Subtitle { codec_id, .. } => Some(*codec_id),
+            Self::Video { codec_id, .. } => Some(*codec_id),
+            Self::Audio { codec_id, .. } => Some(*codec_id),
+            Self::Attachment { codec_id, .. } => Some(*codec_id),
+            Self::Unknown { .. } => None,
+            Self::Data { .. } => None,
+        }
+    }
+}
+
+impl GetAVMediaType for CodecInfo {
+    fn get_avmediatype(&self) -> AVMediaType {
+        self.media_type
+    }
+}
+
+impl GetAVMediaType for StreamInfo {
+    fn get_avmediatype(&self) -> AVMediaType {
+        match self {
+            Self::Subtitle { .. } => AVMediaType::AVMEDIA_TYPE_SUBTITLE,
+            Self::Video { .. } => AVMediaType::AVMEDIA_TYPE_VIDEO,
+            Self::Audio { .. } => AVMediaType::AVMEDIA_TYPE_AUDIO,
+            Self::Attachment { .. } => AVMediaType::AVMEDIA_TYPE_ATTACHMENT,
+            Self::Unknown { .. } => AVMediaType::AVMEDIA_TYPE_UNKNOWN,
+            Self::Data { .. } => AVMediaType::AVMEDIA_TYPE_DATA,
+        }
+    }
+}
+
+impl GetIndex for StreamInfo {
+    fn get_index(&self) -> i32 {
+        *match self {
+            Self::Subtitle { index, .. } => index,
+            Self::Video { index, .. } => index,
+            Self::Audio { index, .. } => index,
+            Self::Attachment { index, .. } => index,
+            Self::Unknown { index, .. } => index,
+            Self::Data { index, .. } => index,
+        }
     }
 }
