@@ -1,7 +1,11 @@
+use ez_ffmpeg::codec::{self as ffcodec, CodecInfo};
+use log::{debug, trace};
+use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::ops::Deref;
 use std::path::Path;
-use std::sync::{LazyLock, Mutex, MutexGuard};
+use std::sync::{LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::{fmt, io};
 
 pub struct Transcoder<'a> {
@@ -50,19 +54,33 @@ pub struct Requirement {
 pub struct TranscoderConfig {
     #[serde(deserialize_with = "deserialize_formats", alias = "supported-formats")]
     supported_formats: Vec<FileExtension>,
-    // #[serde(
-    //     deserialize_with = "deserialize_codecs",
-    //     serialize_with = "serialize_codecs",
-    //     alias = "supported-codecs"
-    // )]
-    supported_codecs: Vec<String>,
-    // supported_codecs: Vec<Codec>,
+    #[serde(
+        deserialize_with = "deserialize_codecs",
+        serialize_with = "serialize_codecs",
+        alias = "supported-codecs"
+    )]
+    supported_codecs: Vec<CodecInfoExtra>,
     #[serde(alias = "requirements")]
     required: BTreeSet<Requirement>,
 }
 
 static CONFIG: LazyLock<Mutex<TranscoderConfig>> =
     LazyLock::new(|| Mutex::new(TranscoderConfig::default()));
+
+pub struct IndexedCodecs {
+    encoders: HashMap<String, CodecInfoExtra>,
+    decoders: HashMap<String, CodecInfoExtra>,
+}
+
+#[derive(Clone, Debug)]
+pub struct CodecInfoExtra {
+    codec: CodecInfo,
+    encoder: bool,
+    decoder: bool,
+}
+
+static CODECS: LazyLock<RwLock<IndexedCodecs>> =
+    LazyLock::new(|| RwLock::new(IndexedCodecs::new()));
 
 enum MediaFile<'a> {
     Input {
@@ -95,14 +113,13 @@ struct TranscodeTask {
 #[derive(PartialEq, Clone)]
 enum TranscodeTaskType {
     Supported,
-    Transcode(/* Codec */),
+    Transcode(CodecInfoExtra),
 }
 
 impl<'a> MediaFile<'a> {
     pub fn new(path: &'a Path) -> Self {
         todo!();
     }
-
 }
 
 impl fmt::Debug for MediaFile<'_> {
@@ -129,6 +146,89 @@ impl TranscoderConfig {
     pub fn set(config: TranscoderConfig) {
         let mut s = Self::get();
         *s = config;
+    }
+}
+
+impl IndexedCodecs {
+    pub fn new() -> Self {
+        let mut encoders = HashMap::default();
+        let mut decoders = HashMap::default();
+
+        Self::put_codecs_to_map(&mut encoders, ffcodec::get_encoders());
+        Self::put_codecs_to_map(&mut decoders, ffcodec::get_decoders());
+
+        let encoders = encoders
+            .into_iter()
+            .map(|(n, codec)| {
+                let codec = CodecInfoExtra {
+                    codec,
+                    encoder: true,
+                    decoder: decoders.get(&n).is_some(),
+                };
+                (n, codec)
+            })
+            .collect::<HashMap<String, CodecInfoExtra>>();
+
+        let decoders = decoders
+            .into_iter()
+            .map(|(n, codec)| {
+                let codec = CodecInfoExtra {
+                    codec,
+                    decoder: true,
+                    encoder: encoders.get(&n).is_some(),
+                };
+                (n, codec)
+            })
+            .collect();
+
+        Self { encoders, decoders }
+    }
+
+    pub fn get<'a>() -> RwLockReadGuard<'a, Self> {
+        CODECS.read().unwrap()
+    }
+
+    pub fn find_in(&self, name: &str) -> Option<&CodecInfoExtra> {
+        let lower = name.to_lowercase();
+        self.decoders
+            .get(&lower)
+            .or_else(|| self.encoders.get(&lower))
+    }
+    pub fn find_decoder_in(&self, name: &str) -> Option<&CodecInfoExtra> {
+        let lower = name.to_lowercase();
+        self.decoders.get(&lower)
+    }
+    pub fn find_encoder_in(&self, name: &str) -> Option<&CodecInfoExtra> {
+        let lower = name.to_lowercase();
+        self.encoders.get(&lower)
+    }
+
+    pub fn find(name: &str) -> Option<CodecInfoExtra> {
+        Self::get().find_in(name).cloned()
+    }
+    pub fn find_encoder(name: &str) -> Option<CodecInfoExtra> {
+        Self::get().find_encoder_in(name).cloned()
+    }
+    pub fn find_decoder(name: &str) -> Option<CodecInfoExtra> {
+        Self::get().find_decoder_in(name).cloned()
+    }
+
+    fn put_codecs_to_map(map: &mut HashMap<String, CodecInfo>, codecs: Vec<CodecInfo>) {
+        for codec in codecs.into_iter() {
+            Self::put_codec_to_map(map, codec);
+        }
+    }
+
+    fn put_codec_to_map(map: &mut HashMap<String, CodecInfo>, codec: CodecInfo) {
+        let name = codec.codec_name.to_lowercase();
+        let longname = codec.codec_long_name.to_lowercase();
+        trace!("Indexing codec: {name} ({longname})");
+        Self::put_codec_to_map_as(map, codec.clone(), name);
+        Self::put_codec_to_map_as(map, codec, longname);
+    }
+
+    fn put_codec_to_map_as(map: &mut HashMap<String, CodecInfo>, codec: CodecInfo, name: String) {
+        map.insert(name, codec);
     }
 }
 
@@ -344,7 +444,7 @@ impl fmt::Debug for TranscodeTaskType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Supported => write!(f, "Supported"),
-            Self::Transcode() => write!(f, "Transcode to ??"),
+            Self::Transcode(codec) => write!(f, "Transcode to {}", codec.codec_long_name),
         }
     }
 }
@@ -417,32 +517,31 @@ fn prioritize<T: Ord>(lh: &Option<T>, rh: &Option<T>) -> std::cmp::Ordering {
     }
 }
 
-// fn deserialize_codecs<'de, D>(deserializer: D) -> Result<Vec<Codec>, D::Error>
-// where
-//     D: serde::Deserializer<'de>,
-// {
-//     let ids = Vec::<String>::deserialize(deserializer)?;
-//     let mut res = Vec::<Codec>::new();
-//     res.reserve(ids.len());
-//     for id_str in ids.into_iter() {
-//         let id_str = id_str.to_lowercase();
-//         let codec = find_codec_by_name(&id_str)
-//             .ok_or_else(|| serde::de::Error::custom(&format!("Unknown codec {id_str}")))?;
-//         res.push(codec);
-//     }
-//     Ok(res)
-// }
-//
-// fn serialize_codecs<S>(codecs: &Vec<Codec>, serializer: S) -> Result<S::Ok, S::Error>
-// where
-//     S: serde::Serializer,
-// {
-//     let mut sec = serializer.serialize_seq(Some(codecs.len()))?;
-//     for c in codecs {
-//         sec.serialize_element(&format!("{:?}", c.id()))?;
-//     }
-//     sec.end()
-// }
+fn deserialize_codecs<'de, D>(deserializer: D) -> Result<Vec<CodecInfoExtra>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let ids = Vec::<String>::deserialize(deserializer)?;
+    let mut res = Vec::<CodecInfoExtra>::new();
+    res.reserve(ids.len());
+    for id_str in ids.into_iter() {
+        let codec = IndexedCodecs::find(&id_str)
+            .ok_or_else(|| serde::de::Error::custom(&format!("Unknown codec {id_str}")))?;
+        res.push(codec);
+    }
+    Ok(res)
+}
+
+fn serialize_codecs<S>(codecs: &Vec<CodecInfoExtra>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    let mut sec = serializer.serialize_seq(Some(codecs.len()))?;
+    for c in codecs {
+        sec.serialize_element(&format!("{}", c.codec_long_name))?;
+    }
+    sec.end()
+}
 
 fn deserialize_formats<'de, D>(deserializer: D) -> Result<Vec<FileExtension>, D::Error>
 where
@@ -459,5 +558,19 @@ fn get_format(path: &Path) -> Option<String> {
         s.to_str().map(str::to_lowercase)
     } else {
         None
+    }
+}
+
+impl Deref for CodecInfoExtra {
+    type Target = CodecInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.codec
+    }
+}
+
+impl PartialEq for CodecInfoExtra {
+    fn eq(&self, other: &Self) -> bool {
+        self.codec_name == other.codec_name
     }
 }
