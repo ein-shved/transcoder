@@ -1,7 +1,7 @@
 {
   rustPlatform,
   pkg-config,
-  ffmpeg_8,
+  ffmpeg_7,
 }:
 rustPlatform.buildRustPackage (finalAttrs: {
   pname = "transcoder";
@@ -26,7 +26,7 @@ rustPlatform.buildRustPackage (finalAttrs: {
   ];
 
   buildInputs = [
-    ffmpeg_8
+    ffmpeg_7
   ];
 
   meta.mainProgram = "transcoder";
