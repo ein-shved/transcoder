@@ -60,8 +60,14 @@ impl Watcher {
                 .union(WatchMask::MOVED_FROM)
                 .union(WatchMask::CLOSE_WRITE),
         )?;
-        Self::recheck(&wp.src, &wp.dst);
+        Self::recheck_fork(&wp.src, &wp.dst);
         self.descriptors.insert(wd, wp);
+        Ok(())
+    }
+
+    pub async fn recheck(wp: WatchPair) -> async_inotify::Result<()> {
+        let wp = wp.absolute()?;
+        Self::check_f(&wp.src, &wp.src, &wp.dst).await;
         Ok(())
     }
 
@@ -120,7 +126,7 @@ impl Watcher {
         }
     }
 
-    fn recheck(src: &Path, dst: &Path) {
+    fn recheck_fork(src: &Path, dst: &Path) {
         let src = src.to_owned();
         let dst = dst.to_owned();
         tokio::spawn(async move { Self::check_f(&src, &src, &dst).await });

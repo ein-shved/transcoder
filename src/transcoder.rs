@@ -2,13 +2,14 @@ use ez_ffmpeg::AVMediaType;
 use ez_ffmpeg::codec::{self as ffcodec, CodecInfo};
 use ez_ffmpeg::stream_info::{StreamInfo, find_all_stream_infos};
 use ffmpeg_sys_next::AVCodecID;
-use log::trace;
+use log::{debug, info, trace};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
+use std::fmt::Debug;
 use std::ops::Deref;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{LazyLock, Mutex, MutexGuard, RwLock, RwLockReadGuard};
 use std::{fmt, io};
@@ -58,15 +59,17 @@ pub struct Requirement {
 #[derive(Default, Deserialize, Serialize)]
 pub struct TranscoderConfig {
     #[serde(deserialize_with = "deserialize_formats", alias = "supported-formats")]
-    supported_formats: Vec<FileExtension>,
+    pub supported_formats: Vec<FileExtension>,
     #[serde(
         deserialize_with = "deserialize_codecs",
         serialize_with = "serialize_codecs",
         alias = "supported-codecs"
     )]
-    supported_codecs: Vec<CodecInfoExtra>,
+    pub supported_codecs: Vec<CodecInfoExtra>,
     #[serde(alias = "requirements")]
-    required: BTreeSet<Requirement>,
+    pub required: BTreeSet<Requirement>,
+    #[serde(default)]
+    pub dryrun: bool,
 }
 
 static CONFIG: LazyLock<Mutex<TranscoderConfig>> =
@@ -124,8 +127,13 @@ enum TranscodeTaskType {
     Transcode(CodecInfoExtra),
 }
 
+struct DebugTask {
+    task: TranscodeTaskType,
+    stream: StreamInfo,
+}
+
 trait Transcodable {
-    fn transcode(self, dst: &Path) -> io::Result<()>;
+    fn transcode(self, dst: &Path, cfg: &TranscoderConfig) -> io::Result<()>;
 }
 
 trait GetAVCodec {
@@ -141,6 +149,16 @@ trait GetIndex {
 }
 
 type Streams = Vec<StreamInfo>;
+
+macro_rules! drylog {
+    ($cfg:expr,  $($arg:tt)*) => {
+        if ($cfg).dryrun {
+            info!($($arg)*);
+        } else {
+            debug!($($arg)*);
+        }
+    };
+}
 
 impl<'a> MediaFile<'a> {
     pub fn new(path: &'a Path, config: &'a TranscoderConfig) -> Self {
@@ -163,38 +181,42 @@ impl<'a> Transcoder<'a> {
         }
     }
     pub fn transcode(self, src: &Path, dst: &Path) -> io::Result<()> {
-        MediaFile::new(src, &self.config).transcode(dst)
+        MediaFile::new(src, &self.config).transcode(dst, &self.config)
     }
 }
 
 impl Transcodable for MediaFile<'_> {
-    fn transcode(self, dst: &Path) -> io::Result<()> {
+    fn transcode(self, dst: &Path, cfg: &TranscoderConfig) -> io::Result<()> {
         match self {
             Self::Input {
                 input,
                 config,
                 path,
-            } => (input, config, path).transcode(dst),
-            Self::Other { path } => path.transcode(dst),
+            } => (input, config, path).transcode(dst, cfg),
+            Self::Other { path } => path.transcode(dst, cfg),
         }
     }
 }
 
 impl Transcodable for &Path {
-    fn transcode(self, dst: &Path) -> io::Result<()> {
-        std::fs::create_dir_all(dst.parent().unwrap_or(Path::new("/")))?;
-        std::os::unix::fs::symlink(self, dst)
+    fn transcode(self, dst: &Path, cfg: &TranscoderConfig) -> io::Result<()> {
+        drylog!(cfg, "Placing symlink from {self:?} to {dst:?}");
+        if !cfg.dryrun {
+            std::fs::create_dir_all(dst.parent().unwrap_or(Path::new("/")))?;
+            std::os::unix::fs::symlink(self, dst)?;
+        }
+        Ok(())
     }
 }
 
 impl Transcodable for (Streams, &TranscoderConfig, &Path) {
-    fn transcode(self, dst: &Path) -> io::Result<()> {
+    fn transcode(self, dst: &Path, cfg: &TranscoderConfig) -> io::Result<()> {
         let (streams, config, src) = self;
         let tasks = MediaFileTasks::new(&streams, config);
         if tasks.need_to_transcode(src) {
-            (streams, tasks, src).transcode(dst)
+            (streams, tasks, src).transcode(dst, cfg)
         } else {
-            src.transcode(dst)
+            src.transcode(dst, cfg)
         }
     }
 }
@@ -210,22 +232,45 @@ impl TranscoderConfig {
 }
 
 impl Transcodable for (Streams, MediaFileTasks<'_>, &Path) {
-    fn transcode(self, dst: &Path) -> io::Result<()> {
+    fn transcode(self, dst: &Path, cfg: &TranscoderConfig) -> io::Result<()> {
         std::fs::create_dir_all(dst.parent().unwrap_or(Path::new("/")))?;
         let (streams, tasks, src) = self;
-        let mut cmd = Command::new("ffmpeg");
-        cmd.arg("-y"); // Agree with all;
-        cmd.arg("-i").arg(src); // add input;
-        cmd.arg("-map").arg("0"); // start mapping for single input;
-        streams.into_iter().fold(&mut cmd, |cmd, stream| {
-            let task = tasks.find_task_for(&stream);
-            // for each stream add its mapping job to command
-            cmd.arg(&format!("-c:{}", stream.get_index())).arg(&task)
-        });
-        cmd.arg(dst); // Finally - set the output
-        trace!("Calling ffmpeg: {cmd:#?}");
-        let mut child = cmd.spawn()?;
-        child.wait()?;
+        let mut dst = PathBuf::from(dst);
+        dst.set_extension(&cfg.supported_formats[0]);
+
+        // Collect streams to tasks list. Do not fold them at once to arguments
+        // to have a chance to debug them
+        let tasks: Vec<_> = streams
+            .into_iter()
+            .map(|stream| {
+                let task = tasks.find_task_for(&stream);
+                DebugTask { stream, task }
+            })
+            .collect();
+
+        drylog!(cfg, "Tasks for {src:?}->{dst:?}: {tasks:#?}");
+
+        if !cfg.dryrun {
+            let mut cmd = Command::new("ffmpeg");
+            cmd.arg("-y"); // Agree with all;
+            if log::max_level() <= log::LevelFilter::Info {
+                cmd.arg("-loglevel").arg("error"); // In common we do not need to see ffmpeg logs
+            }
+            cmd.arg("-i").arg(src); // add input;
+            cmd.arg("-map").arg("0"); // start mapping for single input;
+
+            tasks.into_iter().fold(&mut cmd, |cmd, task| {
+                // for each stream add its mapping job to command
+                cmd.arg(&format!("-c:{}", task.stream.get_index()))
+                    .arg(&task.task)
+            });
+            cmd.arg(&dst); // Finally - set the output
+            info!("Transcoding {src:?} to {dst:?}");
+            trace!("Calling ffmpeg: {cmd:#?}");
+            let mut child = cmd.spawn()?;
+            child.wait()?;
+            info!("Transcoding to {dst:?} done");
+        }
         Ok(())
     }
 }
@@ -654,5 +699,18 @@ impl GetIndex for StreamInfo {
             Self::Unknown { index, .. } => index,
             Self::Data { index, .. } => index,
         }
+    }
+}
+
+impl Debug for DebugTask {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "{}: {:?} ({}) -> {:?}",
+            self.stream.get_index(),
+            self.stream.get_avcodec(),
+            self.stream.stream_type(),
+            self.task
+        )
     }
 }

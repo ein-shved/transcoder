@@ -12,6 +12,8 @@ use transcoder::watcher::{WatchPair, Watcher};
 struct Args {
     #[arg(short, long, required = true)]
     config: PathBuf,
+    #[arg(short, long)]
+    dryrun: bool,
     pair: WatchPair,
     pairs: Vec<WatchPair>,
 }
@@ -30,7 +32,7 @@ async fn main() {
         .to_lowercase();
     let mut reader = File::open(&args.config).unwrap();
 
-    let config: TranscoderConfig = if config_type == "toml" {
+    let mut config: TranscoderConfig = if config_type == "toml" {
         let mut s = String::new();
         reader.read_to_string(&mut s).unwrap();
         toml::from_str(&s).unwrap()
@@ -44,19 +46,30 @@ async fn main() {
             .arg(&args.config)
             .stderr(Stdio::inherit())
             .output()
-            .expect("Unable to process nix config").stdout;
+            .expect("Unable to process nix config")
+            .stdout;
         let json = String::from_utf8(stdout).unwrap();
         serde_json::from_str(&json).unwrap()
     } else {
         panic!("Unsupported config type ${config_type}")
     };
+    config.dryrun = args.dryrun || config.dryrun;
+    let dryrun = config.dryrun;
     debug!("Configuration: {config:#?}");
     TranscoderConfig::set(config);
 
-    let mut watcher = Watcher::new();
-    for pair in std::iter::once(args.pair).chain(args.pairs.into_iter()) {
-        info!("Watching {:?} -> {:?}", pair.src, pair.dst);
-        watcher.add(pair).unwrap();
+    let pairs = std::iter::once(args.pair).chain(args.pairs.into_iter());
+    if !dryrun {
+        let mut watcher = Watcher::new();
+        for pair in pairs {
+            info!("Watching {:?} -> {:?}", pair.src, pair.dst);
+            watcher.add(pair).unwrap();
+        }
+        watcher.watch().await;
+    } else {
+        for pair in pairs {
+            info!("Checking {:?} -> {:?}", pair.src, pair.dst);
+            Watcher::recheck(pair).await.unwrap();
+        }
     }
-    watcher.watch().await;
 }
